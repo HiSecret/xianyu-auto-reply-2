@@ -17,24 +17,22 @@ ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     NODE_PATH=/usr/lib/node_modules
 
-# 安装系统依赖（Debian 12 / Playwright 兼容）
+# 安装系统依赖（只安装保证中文显示的最基本字体）
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        # 基础工具
         nodejs \
         npm \
         tzdata \
         curl \
         ca-certificates \
-        # 图像处理依赖
         libjpeg-dev \
         libpng-dev \
         libfreetype6-dev \
+        # 安装中文支持字体（Noto CJK 和 DejaVu）
         fonts-dejavu-core \
         fonts-liberation2 \
-        fonts-unifont \
-        fonts-noto-core \
-        # Playwright浏览器运行依赖
+        fonts-noto-cjk \
+        # Playwright 浏览器依赖
         libnss3 \
         libnspr4 \
         libatk-bridge2.0-0 \
@@ -66,25 +64,31 @@ RUN apt-get update && \
 # 设置时区
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
+# 验证 Node.js 版本
 RUN node --version && npm --version
 
+# 复制 requirements.txt 并安装 Python 依赖
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# 复制项目文件
 COPY . .
 
-# 只安装浏览器，不调用 install-deps
+# 安装 Playwright 浏览器
 RUN playwright install chromium
 
+# 创建必要的目录并设置权限
 RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
     chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images
 
 EXPOSE 8080
 
+# 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
+# 复制启动脚本
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
