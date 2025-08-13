@@ -1,5 +1,5 @@
-# 使用Python 3.11作为基础镜像
-FROM python:3.11-slim
+# 使用更小的基础镜像（Alpine版）
+FROM python:3.11-alpine
 
 LABEL maintainer="zhinianboke" \
       version="2.1.0" \
@@ -10,6 +10,7 @@ LABEL maintainer="zhinianboke" \
 
 WORKDIR /app
 
+# 设置环境变量
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Shanghai \
@@ -17,49 +18,37 @@ ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     NODE_PATH=/usr/lib/node_modules
 
-# 安装系统依赖（只安装保证中文显示的最基本字体）
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# 安装系统依赖（精简版）
+RUN apk update && \
+    apk add --no-cache \
         nodejs \
         npm \
         tzdata \
         curl \
         ca-certificates \
-        libjpeg-dev \
-        libpng-dev \
-        libfreetype6-dev \
-        # 安装中文支持字体（Noto CJK 和 DejaVu）
-        fonts-dejavu-core \
-        fonts-liberation2 \
-        fonts-noto-cjk \
-        # Playwright 浏览器依赖
+        libjpeg \
+        libpng \
+        freetype \
+        # 安装最小字体依赖
+        ttf-dejavu \
+        ttf-liberation \
+        # 安装Playwright的浏览器依赖
         libnss3 \
-        libnspr4 \
-        libatk-bridge2.0-0 \
-        libdrm2 \
-        libxkbcommon0 \
-        libxcomposite1 \
-        libxdamage1 \
-        libxrandr2 \
-        libgbm1 \
-        libxss1 \
-        libasound2 \
-        libatspi2.0-0 \
-        libgtk-3-0 \
-        libgdk-pixbuf-xlib-2.0-0 \
-        libxcursor1 \
-        libxi6 \
-        libxrender1 \
-        libxext6 \
-        libx11-6 \
-        libxft2 \
-        libxinerama1 \
-        libxtst6 \
-        libappindicator3-1 \
-        libx11-xcb1 \
-        libxfixes3 \
+        libatk-bridge \
+        libdrm \
+        libxkbcommon \
+        libxcomposite \
+        libxdamage \
+        libxrandr \
+        libgbm \
+        libxss \
+        alsa-lib \
+        at-spi2-atk \
+        gtk3 \
+        gdk-pixbuf \
+        x11-libs \
         xdg-utils && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    rm -rf /var/cache/apk/* /tmp/*
 
 # 设置时区
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
