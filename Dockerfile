@@ -43,7 +43,7 @@ RUN apt-get update && \
         libasound2 \
         libatspi2.0-0 \
         libgtk-3-0 \
-        libgdk-pixbuf2.0-0 \
+        libgdk-pixbuf-xlib-2.0-0 \
         libxcursor1 \
         libxi6 \
         libxrender1 \
