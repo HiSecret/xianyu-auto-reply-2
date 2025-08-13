@@ -33,20 +33,19 @@ RUN apk update && \
         ttf-dejavu \
         ttf-liberation \
         # 安装Playwright的浏览器依赖
-        libnss3 \
-        libatk-bridge \
+        nss \
+        atk \
         libdrm \
         libxkbcommon \
         libxcomposite \
         libxdamage \
         libxrandr \
-        libgbm \
         libxss \
         alsa-lib \
         at-spi2-atk \
         gtk3 \
         gdk-pixbuf \
-        x11-libs \
+        x11-utils \
         xdg-utils && \
     rm -rf /var/cache/apk/* /tmp/*
 
