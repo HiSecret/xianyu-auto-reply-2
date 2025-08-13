@@ -32,33 +32,16 @@ RUN apt-get update && \
         libjpeg-dev \
         libpng-dev \
         libfreetype6-dev \
+
         fonts-dejavu-core \
         fonts-liberation \
-        fonts-noto-cjk \
         # Playwright浏览器依赖
+
         libnss3 \
         libnspr4 \
         libatk-bridge2.0-0 \
-        libdrm2 \
-        libxkbcommon0 \
-        libxcomposite1 \
-        libxdamage1 \
-        libxrandr2 \
-        libgbm1 \
-        libxss1 \
-        libasound2 \
-        libatspi2.0-0 \
-        libgtk-3-0 \
-        libgdk-pixbuf-xlib-2.0-0 \
-        libxcursor1 \
-        libxi6 \
-        libxrender1 \
-        libxext6 \
-        libx11-6 \
-        libxft2 \
-        libxinerama1 \
-        libxtst6 \
-        libayatana-appindicator3-1 \
+@@ -60,39 +58,30 @@ RUN apt-get update && \
+        libappindicator3-1 \
         libx11-xcb1 \
         libxfixes3 \
         xdg-utils \
@@ -97,10 +80,7 @@ RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
 EXPOSE 8080
 
 # 健康检查
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
-
-# 复制启动脚本
+@@ -103,5 +92,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
