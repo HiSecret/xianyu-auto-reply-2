@@ -34,6 +34,9 @@ RUN apt-get update && \
         libfreetype6-dev \
         fonts-dejavu-core \
         fonts-liberation \
+        fonts-ubuntu \
+        fonts-unifont \
+        fonts-noto-color-emoji \
         # Playwright浏览器依赖
         libnss3 \
         libnspr4 \
