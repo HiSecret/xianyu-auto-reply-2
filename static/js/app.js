@@ -1752,6 +1752,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // 首先检查认证状态
     const isAuthenticated = await checkAuth();
     if (!isAuthenticated) return;
+
+    // 加载系统版本号
+    loadSystemVersion();
     // 添加Cookie表单提交
     document.getElementById('addForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -2450,6 +2453,78 @@ const channelTypeConfigs = {
         }
     ]
     },
+    feishu: {
+    title: '飞书通知',
+    description: '请设置飞书机器人Webhook URL，支持自定义机器人和群机器人',
+    icon: 'bi-chat-square-text-fill',
+    color: 'warning',
+    fields: [
+        {
+        id: 'webhook_url',
+        label: '飞书机器人Webhook URL',
+        type: 'url',
+        placeholder: 'https://open.feishu.cn/open-apis/bot/v2/hook/...',
+        required: true,
+        help: '飞书机器人的Webhook地址'
+        },
+        {
+        id: 'secret',
+        label: '签名密钥（可选）',
+        type: 'text',
+        placeholder: '输入签名密钥',
+        required: false,
+        help: '如果机器人开启了签名验证，请填写密钥'
+        }
+    ]
+    },
+    bark: {
+    title: 'Bark通知',
+    description: 'iOS推送通知服务，支持自建服务器和官方服务器',
+    icon: 'bi-phone-fill',
+    color: 'dark',
+    fields: [
+        {
+        id: 'device_key',
+        label: '设备密钥',
+        type: 'text',
+        placeholder: '输入Bark设备密钥',
+        required: true,
+        help: 'Bark应用中显示的设备密钥'
+        },
+        {
+        id: 'server_url',
+        label: '服务器地址（可选）',
+        type: 'url',
+        placeholder: 'https://api.day.app',
+        required: false,
+        help: '自建Bark服务器地址，留空使用官方服务器'
+        },
+        {
+        id: 'title',
+        label: '通知标题（可选）',
+        type: 'text',
+        placeholder: '闲鱼自动回复通知',
+        required: false,
+        help: '推送通知的标题'
+        },
+        {
+        id: 'sound',
+        label: '提示音（可选）',
+        type: 'text',
+        placeholder: 'default',
+        required: false,
+        help: '通知提示音，如：alarm, anticipate, bell等'
+        },
+        {
+        id: 'group',
+        label: '分组（可选）',
+        type: 'text',
+        placeholder: 'xianyu',
+        required: false,
+        help: '通知分组名称，用于归类消息'
+        }
+    ]
+    },
     email: {
     title: '邮件通知',
     description: '通过SMTP服务器发送邮件通知，支持各种邮箱服务商',
@@ -2753,6 +2828,8 @@ function renderNotificationChannels(channels) {
     let channelType = channel.type;
     if (channelType === 'ding_talk') {
         channelType = 'dingtalk';  // 兼容旧的类型名
+    } else if (channelType === 'lark') {
+        channelType = 'feishu';  // 兼容lark类型名
     }
     const typeConfig = channelTypeConfigs[channelType];
     const typeDisplay = typeConfig ? typeConfig.title : channel.type;
@@ -2867,6 +2944,8 @@ async function editNotificationChannel(channelId) {
     let channelType = channel.type;
     if (channelType === 'ding_talk') {
         channelType = 'dingtalk';  // 兼容旧的类型名
+    } else if (channelType === 'lark') {
+        channelType = 'feishu';  // 兼容lark类型名
     }
 
     const config = channelTypeConfigs[channelType];
@@ -2891,6 +2970,10 @@ async function editNotificationChannel(channelId) {
         configData = { qq_number: channel.config };
         } else if (channel.type === 'dingtalk' || channel.type === 'ding_talk') {
         configData = { webhook_url: channel.config };
+        } else if (channel.type === 'feishu' || channel.type === 'lark') {
+        configData = { webhook_url: channel.config };
+        } else if (channel.type === 'bark') {
+        configData = { device_key: channel.config };
         } else {
         configData = { config: channel.config };
         }
@@ -5883,7 +5966,12 @@ function updateBatchDeleteButton() {
 // 格式化日期时间
 function formatDateTime(dateString) {
     if (!dateString) return '未知';
-    const date = new Date(dateString);
+    // 如果是ISO格式，直接new Date
+    if (dateString.includes('T') && dateString.endsWith('Z')) {
+        return new Date(dateString).toLocaleString('zh-CN');
+    }
+    // 否则按原有逻辑（可选：补偿8小时）
+    const date = new Date(dateString.replace(' ', 'T') + 'Z');
     return date.toLocaleString('zh-CN');
 }
 
@@ -8554,23 +8642,6 @@ function updateBatchDeleteOrdersButton() {
     }
 }
 
-// 格式化日期时间
-function formatDateTime(dateString) {
-    if (!dateString) return '未知时间';
-
-    try {
-        const date = new Date(dateString);
-        return date.toLocaleString('zh-CN', {
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit'
-        });
-    } catch (error) {
-        return dateString;
-    }
-}
 
 // 页面加载完成后初始化订单搜索功能
 document.addEventListener('DOMContentLoaded', function() {
@@ -9676,3 +9747,165 @@ function exportSearchResults() {
         showToast('导出搜索结果失败', 'danger');
     }
 }
+
+// ================================
+// 版本管理功能
+// ================================
+
+/**
+ * 加载系统版本号并检查更新
+ */
+async function loadSystemVersion() {
+    try {
+        // 从 version.txt 文件读取当前系统版本
+        let currentSystemVersion = 'v1.0.0'; // 默认版本
+
+        try {
+            const versionResponse = await fetch('/static/version.txt');
+            if (versionResponse.ok) {
+                currentSystemVersion = (await versionResponse.text()).trim();
+            }
+        } catch (e) {
+            console.warn('无法读取本地版本文件，使用默认版本');
+        }
+
+        // 显示当前版本
+        document.getElementById('versionNumber').textContent = currentSystemVersion;
+
+        // 获取远程版本并检查更新
+        const response = await fetch('http://xianyu.zhinianblog.cn/index.php?action=getVersion');
+        const result = await response.json();
+
+        if (result.error) {
+            console.error('获取版本号失败:', result.message);
+            return;
+        }
+
+        const remoteVersion = result.data;
+
+        // 检查是否有更新
+        if (remoteVersion !== currentSystemVersion) {
+            showUpdateAvailable(remoteVersion);
+        }
+
+    } catch (error) {
+        console.error('获取版本号失败:', error);
+        document.getElementById('versionNumber').textContent = '未知';
+    }
+}
+
+/**
+ * 显示有更新标签
+ */
+function showUpdateAvailable(newVersion) {
+    const versionContainer = document.querySelector('.version-info');
+
+    if (!versionContainer) {
+        return;
+    }
+
+    // 检查是否已经有更新标签
+    if (versionContainer.querySelector('.update-badge')) {
+        return;
+    }
+
+    // 创建更新标签
+    const updateBadge = document.createElement('span');
+    updateBadge.className = 'badge bg-warning ms-2 update-badge';
+    updateBadge.style.cursor = 'pointer';
+    updateBadge.innerHTML = '<i class="bi bi-arrow-up-circle me-1"></i>有更新';
+    updateBadge.title = `新版本 ${newVersion} 可用，点击查看更新内容`;
+
+    // 点击事件
+    updateBadge.onclick = () => showUpdateInfo(newVersion);
+
+    // 添加到版本信息容器
+    versionContainer.appendChild(updateBadge);
+}
+
+/**
+ * 获取更新信息
+ */
+async function getUpdateInfo() {
+    try {
+        const response = await fetch('http://xianyu.zhinianblog.cn/index.php?action=getUpdateInfo');
+        const result = await response.json();
+
+        if (result.error) {
+            showToast('获取更新信息失败: ' + result.message, 'danger');
+            return null;
+        }
+
+        return result.data;
+
+    } catch (error) {
+        console.error('获取更新信息失败:', error);
+        showToast('获取更新信息失败', 'danger');
+        return null;
+    }
+}
+
+/**
+ * 显示更新信息（点击"有更新"标签时调用）
+ */
+async function showUpdateInfo(newVersion) {
+    const updateInfo = await getUpdateInfo();
+    if (!updateInfo) return;
+
+    let updateList = '';
+    if (updateInfo.updates && updateInfo.updates.length > 0) {
+        updateList = updateInfo.updates.map(item => `<li class="mb-2">${item}</li>`).join('');
+    }
+
+    const modalHtml = `
+        <div class="modal fade" id="updateModal" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header bg-warning text-dark">
+                        <h5 class="modal-title">
+                            <i class="bi bi-arrow-up-circle me-2"></i>版本更新内容
+                        </h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="alert alert-info">
+                            <i class="bi bi-info-circle me-2"></i>
+                            <strong>发现新版本！</strong>以下是最新版本的更新内容。
+                        </div>
+                        <div class="row mb-3">
+                            <div class="col-md-6">
+                                <h6><i class="bi bi-tag me-1"></i>最新版本</h6>
+                                <p class="fs-4 text-success fw-bold">${updateInfo.version}</p>
+                            </div>
+                            <div class="col-md-6">
+                                <h6><i class="bi bi-calendar me-1"></i>发布日期</h6>
+                                <p class="text-muted">${updateInfo.releaseDate || '未知'}</p>
+                            </div>
+                        </div>
+                        <hr>
+                        <h6><i class="bi bi-list-ul me-1"></i>更新内容</h6>
+                        ${updateList ? `<ul class="list-unstyled ps-3">${updateList}</ul>` : '<p class="text-muted">暂无更新内容</p>'}
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+
+    // 移除已存在的模态框
+    const existingModal = document.getElementById('updateModal');
+    if (existingModal) {
+        existingModal.remove();
+    }
+
+    // 添加新的模态框
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+
+    // 显示模态框
+    const modal = new bootstrap.Modal(document.getElementById('updateModal'));
+    modal.show();
+}
+
+

@@ -1,13 +1,15 @@
 # 使用Python 3.11作为基础镜像
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # 设置标签信息
 LABEL maintainer="zhinianboke"
-LABEL version="2.1.0"
+LABEL version="2.2.0"
 LABEL description="闲鱼自动回复系统 - 企业级多用户版本，支持自动发货和免拼发货"
 LABEL repository="https://github.com/zhinianboke/xianyu-auto-reply"
 LABEL license="仅供学习使用，禁止商业用途"
 LABEL author="zhinianboke"
+LABEL build-date=""
+LABEL vcs-ref=""
 
 # 设置工作目录
 WORKDIR /app
@@ -34,8 +36,6 @@ RUN apt-get update && \
         libfreetype6-dev \
         fonts-dejavu-core \
         fonts-liberation \
-        fonts-noto-cjk \
-        fonts-unifont \
         # Playwright浏览器依赖
         libnss3 \
         libnspr4 \
@@ -50,8 +50,7 @@ RUN apt-get update && \
         libasound2 \
         libatspi2.0-0 \
         libgtk-3-0 \
-        libgdk-pixbuf-2.0-0 \
-        libgdk-pixbuf-xlib-2.0-0 \
+        libgdk-pixbuf2.0-0 \
         libxcursor1 \
         libxi6 \
         libxrender1 \
@@ -60,7 +59,7 @@ RUN apt-get update && \
         libxft2 \
         libxinerama1 \
         libxtst6 \
-        libayatana-appindicator3-1 \
+        libappindicator3-1 \
         libx11-xcb1 \
         libxfixes3 \
         xdg-utils \
@@ -84,9 +83,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # 复制项目文件
 COPY . .
 
-# 安装Playwright浏览器（必须在复制项目文件之后）；
-# 依赖已手动安装，跳过 playwright install-deps 以避免拉取 ttf-* 不存在的包
-RUN playwright install chromium
+# 安装Playwright浏览器（必须在复制项目文件之后）
+RUN playwright install chromium && \
+    playwright install-deps chromium
 
 # 创建必要的目录并设置权限
 RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \

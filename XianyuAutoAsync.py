@@ -6,8 +6,6 @@ import base64
 import os
 from loguru import logger
 import websockets
-
-from db_manager import db_manager
 from utils.xianyu_utils import (
     decrypt, generate_mid, generate_uuid, trans_cookies,
     generate_device_id, generate_sign
@@ -120,6 +118,10 @@ class XianyuLive:
     _order_detail_locks = defaultdict(lambda: asyncio.Lock())
     # 记录订单详情锁的使用时间
     _order_detail_lock_times = {}
+
+    # 商品详情缓存（24小时有效）
+    _item_detail_cache = {}  # {item_id: {'detail': str, 'timestamp': float}}
+    _item_detail_cache_lock = asyncio.Lock()
     
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -167,7 +169,7 @@ class XianyuLive:
         # Token刷新相关配置
         self.token_refresh_interval = TOKEN_REFRESH_INTERVAL
         self.token_retry_interval = TOKEN_RETRY_INTERVAL
-        self.last_token_refresh_time = self.get_last_token_refresh_time_by_id()
+        self.last_token_refresh_time = 0
         self.current_token = None
         self.token_refresh_task = None
         self.connection_restart_flag = False  # 连接重启标志
@@ -193,13 +195,21 @@ class XianyuLive:
         # 启动定期清理过期暂停记录的任务
         self.cleanup_task = None
 
-    def get_last_token_refresh_time_by_id(self) -> float:
-        """获取token更新时间"""
-        try:
-            return db_manager.get_cookie_by_id(self.cookie_id).get('last_token_refresh_time', 0)
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】获取最后token更新时间失败: {self._safe_str(e)}")
-            return 0  # 出错时默认启用
+        # Cookie刷新定时任务
+        self.cookie_refresh_task = None
+        self.cookie_refresh_interval = 1200  # 1小时 = 3600秒
+        self.last_cookie_refresh_time = 0
+        self.cookie_refresh_running = False  # 防止重复执行Cookie刷新
+        self.cookie_refresh_enabled = True  # 是否启用Cookie刷新功能
+
+
+
+        # WebSocket连接监控
+        self.connection_failures = 0  # 连续连接失败次数
+        self.max_connection_failures = 5  # 最大连续失败次数
+        self.last_successful_connection = 0  # 上次成功连接时间
+
+
 
     def is_auto_confirm_enabled(self) -> bool:
         """检查当前账号是否启用自动确认发货"""
@@ -644,18 +654,18 @@ class XianyuLive:
 
                         # 发送成功通知
                         if len(delivery_contents) > 1:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券")
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id)
                         else:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功")
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
                     else:
                         logger.warning(f'[{msg_time}] 【自动发货】未找到匹配的发货规则或获取发货内容失败')
                         # 发送自动发货失败通知
-                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "未找到匹配的发货规则或获取发货内容失败")
+                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "未找到匹配的发货规则或获取发货内容失败", chat_id)
 
                 except Exception as e:
                     logger.error(f"自动发货处理异常: {self._safe_str(e)}")
                     # 发送自动发货异常通知
-                    await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"自动发货处理异常: {str(e)}")
+                    await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"自动发货处理异常: {str(e)}", chat_id)
 
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】订单锁释放: {lock_key}，自动发货处理完成')
 
@@ -668,10 +678,13 @@ class XianyuLive:
         """刷新token"""
         try:
             logger.info(f"【{self.cookie_id}】开始刷新token...")
+            # 生成更精确的时间戳
+            timestamp = str(int(time.time() * 1000))
+
             params = {
                 'jsv': '2.7.2',
                 'appKey': '34839810',
-                't': str(int(time.time()) * 1000),
+                't': timestamp,
                 'sign': '',
                 'v': '1.0',
                 'type': 'originaljson',
@@ -680,7 +693,13 @@ class XianyuLive:
                 'timeout': '20000',
                 'api': 'mtop.taobao.idlemessage.pc.login.token',
                 'sessionOption': 'AutoLoginOnly',
+                'dangerouslySetWindvaneParams': '%5Bobject%20Object%5D',
+                'smToken': 'token',
+                'queryToken': 'sm',
+                'sm': 'sm',
                 'spm_cnt': 'a21ybx.im.0.0',
+                'spm_pre': 'a21ybx.home.sidebar.1.4c053da6vYwnmf',
+                'log_id': '4c053da6vYwnmf'
             }
             data_val = '{"appKey":"444e9908a51d1cb236a27862abc769c9","deviceId":"' + self.device_id + '"}'
             data = {
@@ -694,9 +713,25 @@ class XianyuLive:
             sign = generate_sign(params['t'], token, data_val)
             params['sign'] = sign
 
-            # 发送请求
-            headers = DEFAULT_HEADERS.copy()
-            headers['cookie'] = self.cookies_str
+            # 发送请求 - 使用与浏览器完全一致的请求头
+            headers = {
+                'accept': 'application/json',
+                'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'cache-control': 'no-cache',
+                'content-type': 'application/x-www-form-urlencoded',
+                'pragma': 'no-cache',
+                'priority': 'u=1, i',
+                'sec-ch-ua': '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-site',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+                'referer': 'https://www.goofish.com/',
+                'origin': 'https://www.goofish.com',
+                'cookie': self.cookies_str
+            }
 
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -732,18 +767,25 @@ class XianyuLive:
                                 new_token = res_json['data']['accessToken']
                                 self.current_token = new_token
                                 self.last_token_refresh_time = time.time()
-                                db_manager.update_cookie_last_token_refresh_time_by_id(self.cookie_id, self.last_token_refresh_time)
+
                                 logger.info(f"【{self.cookie_id}】Token刷新成功")
                                 return new_token
 
                     logger.error(f"【{self.cookie_id}】Token刷新失败: {res_json}")
-                    
+
+                    # 清空当前token，确保下次重试时重新获取
+                    self.current_token = None
+
                     # 发送Token刷新失败通知
                     await self.send_token_refresh_notification(f"Token刷新失败: {res_json}", "token_refresh_failed")
                     return None
 
         except Exception as e:
             logger.error(f"Token刷新异常: {self._safe_str(e)}")
+
+            # 清空当前token，确保下次重试时重新获取
+            self.current_token = None
+
             # 发送Token刷新异常通知
             await self.send_token_refresh_notification(f"Token刷新异常: {str(e)}", "token_refresh_exception")
             return None
@@ -870,7 +912,7 @@ class XianyuLive:
             return False
 
     async def fetch_item_detail_from_api(self, item_id: str) -> str:
-        """从外部API获取商品详情
+        """获取商品详情（优先使用浏览器，备用外部API，支持24小时缓存）
 
         Args:
             item_id: 商品ID
@@ -887,6 +929,181 @@ class XianyuLive:
                 logger.debug(f"自动获取商品详情功能已禁用: {item_id}")
                 return ""
 
+            # 1. 首先检查缓存（24小时有效）
+            async with self._item_detail_cache_lock:
+                if item_id in self._item_detail_cache:
+                    cache_data = self._item_detail_cache[item_id]
+                    cache_time = cache_data['timestamp']
+                    current_time = time.time()
+
+                    # 检查缓存是否在24小时内
+                    if current_time - cache_time < 24 * 60 * 60:  # 24小时
+                        logger.info(f"从缓存获取商品详情: {item_id}")
+                        return cache_data['detail']
+                    else:
+                        # 缓存过期，删除
+                        del self._item_detail_cache[item_id]
+                        logger.debug(f"缓存已过期，删除: {item_id}")
+
+            # 2. 尝试使用浏览器获取商品详情
+            detail_from_browser = await self._fetch_item_detail_from_browser(item_id)
+            if detail_from_browser:
+                # 保存到缓存
+                async with self._item_detail_cache_lock:
+                    self._item_detail_cache[item_id] = {
+                        'detail': detail_from_browser,
+                        'timestamp': time.time()
+                    }
+                logger.info(f"成功通过浏览器获取商品详情: {item_id}, 长度: {len(detail_from_browser)}")
+                return detail_from_browser
+
+            # 3. 浏览器获取失败，使用外部API作为备用
+            logger.warning(f"浏览器获取商品详情失败，尝试外部API: {item_id}")
+            detail_from_api = await self._fetch_item_detail_from_external_api(item_id)
+            if detail_from_api:
+                # 保存到缓存
+                async with self._item_detail_cache_lock:
+                    self._item_detail_cache[item_id] = {
+                        'detail': detail_from_api,
+                        'timestamp': time.time()
+                    }
+                logger.info(f"成功通过外部API获取商品详情: {item_id}, 长度: {len(detail_from_api)}")
+                return detail_from_api
+
+            logger.warning(f"所有方式都无法获取商品详情: {item_id}")
+            return ""
+
+        except Exception as e:
+            logger.error(f"获取商品详情异常: {item_id}, 错误: {self._safe_str(e)}")
+            return ""
+
+    async def _fetch_item_detail_from_browser(self, item_id: str) -> str:
+        """使用浏览器获取商品详情"""
+        try:
+            from playwright.async_api import async_playwright
+
+            logger.info(f"开始使用浏览器获取商品详情: {item_id}")
+
+            playwright = await async_playwright().start()
+
+            # 启动浏览器（参照order_detail_fetcher的配置）
+            browser_args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-features=TranslateUI',
+                '--disable-ipc-flooding-protection',
+                '--disable-extensions',
+                '--disable-default-apps',
+                '--disable-sync',
+                '--disable-translate',
+                '--hide-scrollbars',
+                '--mute-audio',
+                '--no-default-browser-check',
+                '--no-pings'
+            ]
+
+            # 在Docker环境中添加额外参数
+            if os.getenv('DOCKER_ENV'):
+                browser_args.extend([
+                    '--single-process',
+                    '--disable-background-networking',
+                    '--disable-client-side-phishing-detection',
+                    '--disable-hang-monitor',
+                    '--disable-popup-blocking',
+                    '--disable-prompt-on-repost',
+                    '--disable-web-resources',
+                    '--metrics-recording-only',
+                    '--safebrowsing-disable-auto-update',
+                    '--enable-automation',
+                    '--password-store=basic',
+                    '--use-mock-keychain'
+                ])
+
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=browser_args
+            )
+
+            # 创建浏览器上下文
+            context = await browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+            )
+
+            # 设置Cookie
+            cookies = []
+            for cookie_pair in self.cookies_str.split('; '):
+                if '=' in cookie_pair:
+                    name, value = cookie_pair.split('=', 1)
+                    cookies.append({
+                        'name': name.strip(),
+                        'value': value.strip(),
+                        'domain': '.goofish.com',
+                        'path': '/'
+                    })
+
+            await context.add_cookies(cookies)
+            logger.debug(f"已设置 {len(cookies)} 个Cookie")
+
+            # 创建页面
+            page = await context.new_page()
+
+            # 构造商品详情页面URL
+            item_url = f"https://www.goofish.com/item?id={item_id}"
+            logger.info(f"访问商品页面: {item_url}")
+
+            # 访问页面
+            await page.goto(item_url, wait_until='networkidle', timeout=30000)
+
+            # 等待页面完全加载
+            await asyncio.sleep(3)
+
+            # 获取商品详情内容
+            try:
+                # 等待目标元素出现
+                await page.wait_for_selector('.desc--GaIUKUQY', timeout=10000)
+
+                # 获取商品详情文本
+                detail_element = await page.query_selector('.desc--GaIUKUQY')
+                if detail_element:
+                    detail_text = await detail_element.inner_text()
+                    logger.info(f"成功获取商品详情: {item_id}, 长度: {len(detail_text)}")
+
+                    # 清理资源
+                    await browser.close()
+                    await playwright.stop()
+
+                    return detail_text.strip()
+                else:
+                    logger.warning(f"未找到商品详情元素: {item_id}")
+
+            except Exception as e:
+                logger.warning(f"获取商品详情元素失败: {item_id}, 错误: {self._safe_str(e)}")
+
+            # 清理资源
+            await browser.close()
+            await playwright.stop()
+
+            return ""
+
+        except Exception as e:
+            logger.error(f"浏览器获取商品详情异常: {item_id}, 错误: {self._safe_str(e)}")
+            return ""
+
+    async def _fetch_item_detail_from_external_api(self, item_id: str) -> str:
+        """从外部API获取商品详情（备用方案）"""
+        try:
+            from config import config
+            auto_fetch_config = config.get('ITEM_DETAIL', {}).get('auto_fetch', {})
+
             # 从配置获取API地址和超时时间
             api_base_url = auto_fetch_config.get('api_url', 'https://selfapi.zhinianboke.com/api/getItemDetail')
             timeout_seconds = auto_fetch_config.get('timeout', 10)
@@ -897,7 +1114,6 @@ class XianyuLive:
 
             # 使用aiohttp发送异步请求
             import aiohttp
-            import asyncio
 
             timeout = aiohttp.ClientTimeout(total=timeout_seconds)
 
@@ -909,21 +1125,20 @@ class XianyuLive:
                         # 检查返回状态
                         if result.get('status') == '200' and result.get('data'):
                             item_detail = result['data']
-                            logger.info(f"成功获取商品详情: {item_id}, 长度: {len(item_detail)}")
-                            logger.debug(f"商品详情内容: {item_detail[:200]}...")
+                            logger.info(f"外部API成功获取商品详情: {item_id}, 长度: {len(item_detail)}")
                             return item_detail
                         else:
-                            logger.warning(f"API返回状态异常: {result.get('status')}, message: {result.get('message')}")
+                            logger.warning(f"外部API返回状态异常: {result.get('status')}, message: {result.get('message')}")
                             return ""
                     else:
-                        logger.warning(f"API请求失败: HTTP {response.status}")
+                        logger.warning(f"外部API请求失败: HTTP {response.status}")
                         return ""
 
         except asyncio.TimeoutError:
-            logger.warning(f"获取商品详情超时: {item_id}")
+            logger.warning(f"外部API获取商品详情超时: {item_id}")
             return ""
         except Exception as e:
-            logger.error(f"获取商品详情异常: {item_id}, 错误: {self._safe_str(e)}")
+            logger.error(f"外部API获取商品详情异常: {item_id}, 错误: {self._safe_str(e)}")
             return ""
 
     async def save_items_list_to_db(self, items_list):
@@ -1598,11 +1813,21 @@ class XianyuLive:
         except:
             return 0.0
 
-    async def send_notification(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None):
+    async def send_notification(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None, chat_id: str = None):
         """发送消息通知"""
         try:
             from db_manager import db_manager
             import aiohttp
+
+            # 过滤系统默认消息，不发送通知
+            system_messages = [
+                '发来一条消息',
+                '发来一条新消息'
+            ]
+
+            if send_message in system_messages:
+                logger.debug(f"📱 系统消息不发送通知: {send_message}")
+                return
 
             logger.info(f"📱 开始发送消息通知 - 账号: {self.cookie_id}, 买家: {send_user_name}")
 
@@ -1620,6 +1845,7 @@ class XianyuLive:
                              f"账号: {self.cookie_id}\n" \
                              f"买家: {send_user_name} (ID: {send_user_id})\n" \
                              f"商品ID: {item_id or '未知'}\n" \
+                             f"聊天ID: {chat_id or '未知'}\n" \
                              f"消息内容: {send_message}\n" \
                              f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
@@ -1648,6 +1874,12 @@ class XianyuLive:
                         case 'ding_talk' | 'dingtalk':
                             logger.info(f"📱 开始发送钉钉通知...")
                             await self._send_dingtalk_notification(config_data, notification_msg)
+                        case 'feishu' | 'lark':
+                            logger.info(f"📱 开始发送飞书通知...")
+                            await self._send_feishu_notification(config_data, notification_msg)
+                        case 'bark':
+                            logger.info(f"📱 开始发送Bark通知...")
+                            await self._send_bark_notification(config_data, notification_msg)
                         case 'email':
                             logger.info(f"📱 开始发送邮件通知...")
                             await self._send_email_notification(config_data, notification_msg)
@@ -1774,7 +2006,7 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"发送钉钉通知异常: {self._safe_str(e)}")
 
-    async def _send_webhook_notification(self, config_data: dict, message: str):
+    async def _send_feishu_notification(self, config_data: dict, message: str):
         """发送飞书通知"""
         try:
             import aiohttp
@@ -1782,27 +2014,150 @@ class XianyuLive:
             import hmac
             import hashlib
             import base64
-            import time
+
+            logger.info(f"📱 飞书通知 - 开始处理配置数据: {config_data}")
 
             # 解析配置
-            webhook_url = config_data.get('webhook_url') or config_data.get('config', '')
+            webhook_url = config_data.get('webhook_url', '')
+            secret = config_data.get('secret', '')
 
-            webhook_url = webhook_url.strip() if webhook_url else ''
+            logger.info(f"📱 飞书通知 - Webhook URL: {webhook_url[:50]}...")
+            logger.info(f"📱 飞书通知 - 是否有签名密钥: {'是' if secret else '否'}")
+
             if not webhook_url:
-                logger.warning("飞书通知配置为空")
+                logger.warning("📱 飞书通知 - Webhook URL配置为空，无法发送通知")
                 return
 
-            data = {"msg_type": "text", "content": {"text": f"闲鱼\n\n{message}"}}
+            # 如果有加签密钥，生成签名
+            timestamp = str(int(time.time()))
+            sign = ""
 
+            if secret:
+                string_to_sign = f'{timestamp}\n{secret}'
+                hmac_code = hmac.new(
+                    secret.encode('utf-8'),
+                    string_to_sign.encode('utf-8'),
+                    digestmod=hashlib.sha256
+                ).digest()
+                sign = base64.b64encode(hmac_code).decode('utf-8')
+                logger.info(f"📱 飞书通知 - 已生成签名")
+
+            # 构建请求数据
+            data = {
+                "msg_type": "text",
+                "content": {
+                    "text": message
+                },
+                "timestamp": timestamp
+            }
+
+            # 如果有签名，添加到请求数据中
+            if sign:
+                data["sign"] = sign
+
+            logger.info(f"📱 飞书通知 - 请求数据构建完成")
+
+            # 发送POST请求
             async with aiohttp.ClientSession() as session:
-                async with session.post(webhook_url, data=json.dumps(data), timeout=10) as response:
+                async with session.post(webhook_url, json=data, timeout=10) as response:
+                    response_text = await response.text()
+                    logger.info(f"📱 飞书通知 - 响应状态: {response.status}")
+                    logger.info(f"📱 飞书通知 - 响应内容: {response_text}")
+
                     if response.status == 200:
-                        logger.info(f"飞书通知发送成功")
+                        try:
+                            response_json = json.loads(response_text)
+                            if response_json.get('code') == 0:
+                                logger.info(f"📱 飞书通知发送成功")
+                            else:
+                                logger.warning(f"📱 飞书通知发送失败: {response_json.get('msg', '未知错误')}")
+                        except json.JSONDecodeError:
+                            logger.info(f"📱 飞书通知发送成功（响应格式异常）")
                     else:
-                        logger.warning(f"飞书通知发送失败: {response.status}")
+                        logger.warning(f"📱 飞书通知发送失败: HTTP {response.status}, 响应: {response_text}")
 
         except Exception as e:
-            logger.error(f"飞书通知异常: {self._safe_str(e)}")
+            logger.error(f"📱 发送飞书通知异常: {self._safe_str(e)}")
+            import traceback
+            logger.error(f"📱 飞书通知异常详情: {traceback.format_exc()}")
+
+    async def _send_bark_notification(self, config_data: dict, message: str):
+        """发送Bark通知"""
+        try:
+            import aiohttp
+            import json
+            from urllib.parse import quote
+
+            logger.info(f"📱 Bark通知 - 开始处理配置数据: {config_data}")
+
+            # 解析配置
+            server_url = config_data.get('server_url', 'https://api.day.app').rstrip('/')
+            device_key = config_data.get('device_key', '')
+            title = config_data.get('title', '闲鱼自动回复通知')
+            sound = config_data.get('sound', 'default')
+            icon = config_data.get('icon', '')
+            group = config_data.get('group', 'xianyu')
+            url = config_data.get('url', '')
+
+            logger.info(f"📱 Bark通知 - 服务器: {server_url}")
+            logger.info(f"📱 Bark通知 - 设备密钥: {device_key[:10]}..." if device_key else "📱 Bark通知 - 设备密钥: 未设置")
+            logger.info(f"📱 Bark通知 - 标题: {title}")
+
+            if not device_key:
+                logger.warning("📱 Bark通知 - 设备密钥配置为空，无法发送通知")
+                return
+
+            # 构建请求URL和数据
+            # Bark支持两种方式：URL路径方式和POST JSON方式
+            # 这里使用POST JSON方式，更灵活且支持更多参数
+
+            api_url = f"{server_url}/push"
+
+            # 构建请求数据
+            data = {
+                "device_key": device_key,
+                "title": title,
+                "body": message,
+                "sound": sound,
+                "group": group
+            }
+
+            # 可选参数
+            if icon:
+                data["icon"] = icon
+            if url:
+                data["url"] = url
+
+            logger.info(f"📱 Bark通知 - API地址: {api_url}")
+            logger.info(f"📱 Bark通知 - 请求数据构建完成")
+
+            # 发送POST请求
+            async with aiohttp.ClientSession() as session:
+                async with session.post(api_url, json=data, timeout=10) as response:
+                    response_text = await response.text()
+                    logger.info(f"📱 Bark通知 - 响应状态: {response.status}")
+                    logger.info(f"📱 Bark通知 - 响应内容: {response_text}")
+
+                    if response.status == 200:
+                        try:
+                            response_json = json.loads(response_text)
+                            if response_json.get('code') == 200:
+                                logger.info(f"📱 Bark通知发送成功")
+                            else:
+                                logger.warning(f"📱 Bark通知发送失败: {response_json.get('message', '未知错误')}")
+                        except json.JSONDecodeError:
+                            # 某些Bark服务器可能返回纯文本
+                            if 'success' in response_text.lower() or 'ok' in response_text.lower():
+                                logger.info(f"📱 Bark通知发送成功")
+                            else:
+                                logger.warning(f"📱 Bark通知响应格式异常: {response_text}")
+                    else:
+                        logger.warning(f"📱 Bark通知发送失败: HTTP {response.status}, 响应: {response_text}")
+
+        except Exception as e:
+            logger.error(f"📱 发送Bark通知异常: {self._safe_str(e)}")
+            import traceback
+            logger.error(f"📱 Bark通知异常详情: {traceback.format_exc()}")
 
     async def _send_email_notification(self, config_data: dict, message: str):
         """发送邮件通知"""
@@ -1843,56 +2198,56 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"发送邮件通知异常: {self._safe_str(e)}")
 
-    # async def _send_webhook_notification(self, config_data: dict, message: str):
-    #     """发送Webhook通知"""
-    #     try:
-    #         import aiohttp
-    #         import json
-    #
-    #         # 解析配置
-    #         webhook_url = config_data.get('webhook_url', '')
-    #         http_method = config_data.get('http_method', 'POST').upper()
-    #         headers_str = config_data.get('headers', '{}')
-    #
-    #         if not webhook_url:
-    #             logger.warning("Webhook通知配置为空")
-    #             return
-    #
-    #         # 解析自定义请求头
-    #         try:
-    #             custom_headers = json.loads(headers_str) if headers_str else {}
-    #         except json.JSONDecodeError:
-    #             custom_headers = {}
-    #
-    #         # 设置默认请求头
-    #         headers = {'Content-Type': 'application/json'}
-    #         headers.update(custom_headers)
-    #
-    #         # 构建请求数据
-    #         data = {
-    #             'message': message,
-    #             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-    #             'source': 'xianyu-auto-reply'
-    #         }
-    #
-    #         async with aiohttp.ClientSession() as session:
-    #             if http_method == 'POST':
-    #                 async with session.post(webhook_url, json=data, headers=headers, timeout=10) as response:
-    #                     if response.status == 200:
-    #                         logger.info(f"Webhook通知发送成功")
-    #                     else:
-    #                         logger.warning(f"Webhook通知发送失败: {response.status}")
-    #             elif http_method == 'PUT':
-    #                 async with session.put(webhook_url, json=data, headers=headers, timeout=10) as response:
-    #                     if response.status == 200:
-    #                         logger.info(f"Webhook通知发送成功")
-    #                     else:
-    #                         logger.warning(f"Webhook通知发送失败: {response.status}")
-    #             else:
-    #                 logger.warning(f"不支持的HTTP方法: {http_method}")
-    #
-    #     except Exception as e:
-    #         logger.error(f"发送Webhook通知异常: {self._safe_str(e)}")
+    async def _send_webhook_notification(self, config_data: dict, message: str):
+        """发送Webhook通知"""
+        try:
+            import aiohttp
+            import json
+
+            # 解析配置
+            webhook_url = config_data.get('webhook_url', '')
+            http_method = config_data.get('http_method', 'POST').upper()
+            headers_str = config_data.get('headers', '{}')
+
+            if not webhook_url:
+                logger.warning("Webhook通知配置为空")
+                return
+
+            # 解析自定义请求头
+            try:
+                custom_headers = json.loads(headers_str) if headers_str else {}
+            except json.JSONDecodeError:
+                custom_headers = {}
+
+            # 设置默认请求头
+            headers = {'Content-Type': 'application/json'}
+            headers.update(custom_headers)
+
+            # 构建请求数据
+            data = {
+                'message': message,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'source': 'xianyu-auto-reply'
+            }
+
+            async with aiohttp.ClientSession() as session:
+                if http_method == 'POST':
+                    async with session.post(webhook_url, json=data, headers=headers, timeout=10) as response:
+                        if response.status == 200:
+                            logger.info(f"Webhook通知发送成功")
+                        else:
+                            logger.warning(f"Webhook通知发送失败: {response.status}")
+                elif http_method == 'PUT':
+                    async with session.put(webhook_url, json=data, headers=headers, timeout=10) as response:
+                        if response.status == 200:
+                            logger.info(f"Webhook通知发送成功")
+                        else:
+                            logger.warning(f"Webhook通知发送失败: {response.status}")
+                else:
+                    logger.warning(f"不支持的HTTP方法: {http_method}")
+
+        except Exception as e:
+            logger.error(f"发送Webhook通知异常: {self._safe_str(e)}")
 
     async def _send_wechat_notification(self, config_data: dict, message: str):
         """发送微信通知"""
@@ -1956,7 +2311,7 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"发送Telegram通知异常: {self._safe_str(e)}")
 
-    async def send_token_refresh_notification(self, error_message: str, notification_type: str = "token_refresh"):
+    async def send_token_refresh_notification(self, error_message: str, notification_type: str = "token_refresh", chat_id: str = None):
         """发送Token刷新异常通知（带防重复机制）"""
         try:
             # 检查是否是正常的令牌过期，这种情况不需要发送通知
@@ -2006,6 +2361,7 @@ class XianyuLive:
             notification_msg = f"""🔴 闲鱼账号Token刷新异常
 
 账号ID: {self.cookie_id}
+聊天ID: {chat_id or '未知'}
 异常时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}
 异常信息: {error_message}
 
@@ -2032,6 +2388,12 @@ class XianyuLive:
                             notification_sent = True
                         case 'ding_talk' | 'dingtalk':
                             await self._send_dingtalk_notification(config_data, notification_msg)
+                            notification_sent = True
+                        case 'feishu' | 'lark':
+                            await self._send_feishu_notification(config_data, notification_msg)
+                            notification_sent = True
+                        case 'bark':
+                            await self._send_bark_notification(config_data, notification_msg)
                             notification_sent = True
                         case 'email':
                             await self._send_email_notification(config_data, notification_msg)
@@ -2141,7 +2503,7 @@ class XianyuLive:
 
         return False
 
-    async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str):
+    async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str, chat_id: str = None):
         """发送自动发货失败通知"""
         try:
             from db_manager import db_manager
@@ -2158,6 +2520,7 @@ class XianyuLive:
                                  f"账号: {self.cookie_id}\n" \
                                  f"买家: {send_user_name} (ID: {send_user_id})\n" \
                                  f"商品ID: {item_id}\n" \
+                                 f"聊天ID: {chat_id or '未知'}\n" \
                                  f"结果: {error_message}\n" \
                                  f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
                                  f"请及时处理！"
@@ -2907,6 +3270,10 @@ class XianyuLive:
                         break
                     else:
                         logger.error(f"【{self.cookie_id}】Token刷新失败，将在{self.token_retry_interval // 60}分钟后重试")
+
+                        # 清空当前token，确保下次重试时重新获取
+                        self.current_token = None
+
                         # 发送Token刷新失败通知
                         await self.send_token_refresh_notification("Token定时刷新失败，将自动重试", "token_scheduled_refresh_failed")
                         await asyncio.sleep(self.token_retry_interval)
@@ -2991,6 +3358,7 @@ class XianyuLive:
         if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
             logger.info(f"【{self.cookie_id}】获取初始token...")
             token_refresh_attempted = True
+
             await self.refresh_token()
 
         if not self.current_token:
@@ -3052,6 +3420,9 @@ class XianyuLive:
 
     async def heartbeat_loop(self, ws):
         """心跳循环"""
+        consecutive_failures = 0
+        max_failures = 3  # 连续失败3次后停止心跳
+
         while True:
             try:
                 # 检查账号是否启用
@@ -3060,11 +3431,26 @@ class XianyuLive:
                     logger.info(f"【{self.cookie_id}】账号已禁用，停止心跳循环")
                     break
 
+                # 检查WebSocket连接状态
+                if ws.closed:
+                    logger.warning(f"【{self.cookie_id}】WebSocket连接已关闭，停止心跳循环")
+                    break
+
                 await self.send_heartbeat(ws)
+                consecutive_failures = 0  # 重置失败计数
+
                 await asyncio.sleep(self.heartbeat_interval)
+
             except Exception as e:
-                logger.error(f"心跳发送失败: {self._safe_str(e)}")
-                break
+                consecutive_failures += 1
+                logger.error(f"心跳发送失败 ({consecutive_failures}/{max_failures}): {self._safe_str(e)}")
+
+                if consecutive_failures >= max_failures:
+                    logger.error(f"【{self.cookie_id}】心跳连续失败{max_failures}次，停止心跳循环")
+                    break
+
+                # 失败后短暂等待再重试
+                await asyncio.sleep(5)
 
     async def handle_heartbeat_response(self, message_data):
         """处理心跳响应"""
@@ -3089,15 +3475,385 @@ class XianyuLive:
 
                 # 清理过期的暂停记录
                 pause_manager.cleanup_expired_pauses()
-                
+
                 # 清理过期的锁（每5分钟清理一次，保留24小时内的锁）
                 self.cleanup_expired_locks(max_age_hours=24)
-                
+
                 # 每5分钟清理一次
                 await asyncio.sleep(300)
             except Exception as e:
                 logger.error(f"【{self.cookie_id}】清理任务失败: {self._safe_str(e)}")
                 await asyncio.sleep(300)  # 出错后也等待5分钟再重试
+
+    async def cookie_refresh_loop(self):
+        """Cookie刷新定时任务 - 每小时执行一次"""
+        while True:
+            try:
+                # 检查账号是否启用
+                from cookie_manager import manager as cookie_manager
+                if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
+                    logger.info(f"【{self.cookie_id}】账号已禁用，停止Cookie刷新循环")
+                    break
+
+                # 检查Cookie刷新功能是否启用
+                if not self.cookie_refresh_enabled:
+                    logger.debug(f"【{self.cookie_id}】Cookie刷新功能已禁用，跳过执行")
+                    await asyncio.sleep(300)  # 5分钟后再检查
+                    continue
+
+                current_time = time.time()
+                if current_time - self.last_cookie_refresh_time >= self.cookie_refresh_interval:
+                    # 检查是否已有Cookie刷新任务在执行
+                    if self.cookie_refresh_running:
+                        logger.debug(f"【{self.cookie_id}】Cookie刷新任务已在执行中，跳过本次触发")
+                    else:
+                        logger.info(f"【{self.cookie_id}】开始执行Cookie刷新任务...")
+                        # 在独立的任务中执行Cookie刷新，避免阻塞主循环
+                        asyncio.create_task(self._execute_cookie_refresh(current_time))
+
+                # 每分钟检查一次是否需要执行
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"【{self.cookie_id}】Cookie刷新循环失败: {self._safe_str(e)}")
+                await asyncio.sleep(60)  # 出错后也等待1分钟再重试
+
+    async def _execute_cookie_refresh(self, current_time):
+        """独立执行Cookie刷新任务，避免阻塞主循环"""
+
+
+        # 设置运行状态，防止重复执行
+        self.cookie_refresh_running = True
+
+        try:
+            logger.info(f"【{self.cookie_id}】开始Cookie刷新任务，暂时暂停心跳以避免连接冲突...")
+
+            # 暂时暂停心跳任务，避免与浏览器操作冲突
+            heartbeat_was_running = False
+            if self.heartbeat_task and not self.heartbeat_task.done():
+                heartbeat_was_running = True
+                self.heartbeat_task.cancel()
+                logger.debug(f"【{self.cookie_id}】已暂停心跳任务")
+
+            # 为整个Cookie刷新任务添加超时保护（3分钟，缩短时间减少影响）
+            success = await asyncio.wait_for(
+                self._refresh_cookies_via_browser(),
+                timeout=180.0  # 3分钟超时，减少对WebSocket的影响
+            )
+
+            # 重新启动心跳任务
+            if heartbeat_was_running and self.ws and not self.ws.closed:
+                logger.debug(f"【{self.cookie_id}】重新启动心跳任务")
+                self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+
+            if success:
+                self.last_cookie_refresh_time = current_time
+                logger.info(f"【{self.cookie_id}】Cookie刷新任务完成，心跳已恢复")
+            else:
+                logger.warning(f"【{self.cookie_id}】Cookie刷新任务失败")
+                # 即使失败也要更新时间，避免频繁重试
+                self.last_cookie_refresh_time = current_time
+
+        except asyncio.TimeoutError:
+            # 超时也要更新时间，避免频繁重试
+            self.last_cookie_refresh_time = current_time
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】执行Cookie刷新任务异常: {self._safe_str(e)}")
+            # 异常也要更新时间，避免频繁重试
+            self.last_cookie_refresh_time = current_time
+        finally:
+            # 确保心跳任务恢复（如果WebSocket仍然连接）
+            if (self.ws and not self.ws.closed and
+                (not self.heartbeat_task or self.heartbeat_task.done())):
+                logger.info(f"【{self.cookie_id}】Cookie刷新完成，心跳任务正常运行")
+                self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
+
+            # 清除运行状态
+            self.cookie_refresh_running = False
+
+
+
+    def enable_cookie_refresh(self, enabled: bool = True):
+        """启用或禁用Cookie刷新功能"""
+        self.cookie_refresh_enabled = enabled
+        status = "启用" if enabled else "禁用"
+        logger.info(f"【{self.cookie_id}】Cookie刷新功能已{status}")
+
+    async def _refresh_cookies_via_browser(self):
+        """通过浏览器访问指定页面刷新Cookie"""
+
+
+        playwright = None
+        browser = None
+        try:
+            import asyncio
+            from playwright.async_api import async_playwright
+
+            logger.info(f"【{self.cookie_id}】开始通过浏览器刷新Cookie...")
+            logger.info(f"【{self.cookie_id}】刷新前Cookie长度: {len(self.cookies_str)}")
+            logger.info(f"【{self.cookie_id}】刷新前Cookie字段数: {len(self.cookies)}")
+
+            # Docker环境下修复asyncio子进程问题
+            is_docker = os.getenv('DOCKER_ENV') or os.path.exists('/.dockerenv')
+
+            if is_docker:
+                logger.debug(f"【{self.cookie_id}】检测到Docker环境，应用asyncio修复")
+
+                # 创建一个完整的虚拟子进程监视器
+                class DummyChildWatcher:
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *args):
+                        pass
+                    def is_active(self):
+                        return True
+                    def add_child_handler(self, *args, **kwargs):
+                        pass
+                    def remove_child_handler(self, *args, **kwargs):
+                        pass
+                    def attach_loop(self, *args, **kwargs):
+                        pass
+                    def close(self):
+                        pass
+                    def __del__(self):
+                        pass
+
+                # 创建自定义事件循环策略
+                class DockerEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+                    def get_child_watcher(self):
+                        return DummyChildWatcher()
+
+                # 临时设置策略
+                old_policy = asyncio.get_event_loop_policy()
+                asyncio.set_event_loop_policy(DockerEventLoopPolicy())
+
+                try:
+                    # 添加超时机制，避免无限等待
+                    playwright = await asyncio.wait_for(
+                        async_playwright().start(),
+                        timeout=30.0  # 30秒超时
+                    )
+                    logger.debug(f"【{self.cookie_id}】Docker环境下Playwright启动成功")
+                except asyncio.TimeoutError:
+                    logger.error(f"【{self.cookie_id}】Docker环境下Playwright启动超时")
+                    return False
+                finally:
+                    # 恢复原策略
+                    asyncio.set_event_loop_policy(old_policy)
+            else:
+                # 非Docker环境，正常启动（也添加超时保护）
+                try:
+                    playwright = await asyncio.wait_for(
+                        async_playwright().start(),
+                        timeout=30.0  # 30秒超时
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"【{self.cookie_id}】Playwright启动超时")
+                    return False
+
+            # 启动浏览器（参照商品搜索的配置）
+            browser_args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-features=TranslateUI',
+                '--disable-ipc-flooding-protection',
+                '--disable-extensions',
+                '--disable-default-apps',
+                '--disable-sync',
+                '--disable-translate',
+                '--hide-scrollbars',
+                '--mute-audio',
+                '--no-default-browser-check',
+                '--no-pings'
+            ]
+
+            # 在Docker环境中添加额外参数
+            if os.getenv('DOCKER_ENV'):
+                browser_args.extend([
+                    '--single-process',
+                    '--disable-background-networking',
+                    '--disable-client-side-phishing-detection',
+                    '--disable-hang-monitor',
+                    '--disable-popup-blocking',
+                    '--disable-prompt-on-repost',
+                    '--disable-web-resources',
+                    '--metrics-recording-only',
+                    '--safebrowsing-disable-auto-update',
+                    '--enable-automation',
+                    '--password-store=basic',
+                    '--use-mock-keychain'
+                ])
+
+            # Cookie刷新模式使用无头浏览器
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=browser_args
+            )
+
+            # 创建浏览器上下文
+            context_options = {
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+            }
+
+            # 使用标准窗口大小
+            context_options['viewport'] = {'width': 1920, 'height': 1080}
+
+            context = await browser.new_context(**context_options)
+
+            # 设置当前Cookie
+            cookies = []
+            for cookie_pair in self.cookies_str.split('; '):
+                if '=' in cookie_pair:
+                    name, value = cookie_pair.split('=', 1)
+                    cookies.append({
+                        'name': name.strip(),
+                        'value': value.strip(),
+                        'domain': '.goofish.com',
+                        'path': '/'
+                    })
+
+            await context.add_cookies(cookies)
+            logger.info(f"【{self.cookie_id}】已设置 {len(cookies)} 个Cookie到浏览器")
+
+            # 创建页面
+            page = await context.new_page()
+
+            # 等待页面准备
+            await asyncio.sleep(0.1)
+
+            # 访问指定页面
+            target_url = "https://www.goofish.com/im?spm=a21ybx.home.sidebar.1.4c053da6vYwnmf"
+            logger.info(f"【{self.cookie_id}】访问页面: {target_url}")
+
+            # 使用更灵活的页面访问策略
+            try:
+                # 首先尝试较短超时
+                await page.goto(target_url, wait_until='domcontentloaded', timeout=15000)
+                logger.info(f"【{self.cookie_id}】页面访问成功")
+            except Exception as e:
+                if 'timeout' in str(e).lower():
+                    logger.warning(f"【{self.cookie_id}】页面访问超时，尝试降级策略...")
+                    try:
+                        # 降级策略：只等待基本加载
+                        await page.goto(target_url, wait_until='load', timeout=20000)
+                        logger.info(f"【{self.cookie_id}】页面访问成功（降级策略）")
+                    except Exception as e2:
+                        logger.warning(f"【{self.cookie_id}】降级策略也失败，尝试最基本访问...")
+                        # 最后尝试：不等待任何加载完成
+                        await page.goto(target_url, timeout=25000)
+                        logger.info(f"【{self.cookie_id}】页面访问成功（最基本策略）")
+                else:
+                    raise e
+
+            # Cookie刷新模式：执行两次刷新
+            logger.info(f"【{self.cookie_id}】页面加载完成，开始刷新...")
+            await asyncio.sleep(1)
+
+            # 第一次刷新 - 带重试机制
+            logger.info(f"【{self.cookie_id}】执行第一次刷新...")
+            try:
+                await page.reload(wait_until='domcontentloaded', timeout=12000)
+                logger.info(f"【{self.cookie_id}】第一次刷新成功")
+            except Exception as e:
+                if 'timeout' in str(e).lower():
+                    logger.warning(f"【{self.cookie_id}】第一次刷新超时，使用降级策略...")
+                    await page.reload(wait_until='load', timeout=15000)
+                    logger.info(f"【{self.cookie_id}】第一次刷新成功（降级策略）")
+                else:
+                    raise e
+            await asyncio.sleep(1)
+
+            # 第二次刷新 - 带重试机制
+            logger.info(f"【{self.cookie_id}】执行第二次刷新...")
+            try:
+                await page.reload(wait_until='domcontentloaded', timeout=12000)
+                logger.info(f"【{self.cookie_id}】第二次刷新成功")
+            except Exception as e:
+                if 'timeout' in str(e).lower():
+                    logger.warning(f"【{self.cookie_id}】第二次刷新超时，使用降级策略...")
+                    await page.reload(wait_until='load', timeout=15000)
+                    logger.info(f"【{self.cookie_id}】第二次刷新成功（降级策略）")
+                else:
+                    raise e
+            await asyncio.sleep(1)
+
+            # Cookie刷新模式：正常更新Cookie
+            logger.info(f"【{self.cookie_id}】获取更新后的Cookie...")
+            updated_cookies = await context.cookies()
+
+            # 构造新的Cookie字典
+            new_cookies_dict = {}
+            for cookie in updated_cookies:
+                new_cookies_dict[cookie['name']] = cookie['value']
+
+            # 检查Cookie变化
+            changed_cookies = []
+            new_cookies = []
+            for name, new_value in new_cookies_dict.items():
+                old_value = self.cookies.get(name)
+                if old_value is None:
+                    new_cookies.append(name)
+                elif old_value != new_value:
+                    changed_cookies.append(name)
+
+            # 更新self.cookies和cookies_str
+            self.cookies.update(new_cookies_dict)
+            self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+
+            logger.info(f"【{self.cookie_id}】Cookie已更新，包含 {len(new_cookies_dict)} 个字段")
+
+            # 显示Cookie变化统计
+            if changed_cookies:
+                logger.info(f"【{self.cookie_id}】发生变化的Cookie字段 ({len(changed_cookies)}个): {', '.join(changed_cookies)}")
+            if new_cookies:
+                logger.info(f"【{self.cookie_id}】新增的Cookie字段 ({len(new_cookies)}个): {', '.join(new_cookies)}")
+            if not changed_cookies and not new_cookies:
+                logger.info(f"【{self.cookie_id}】Cookie无变化")
+
+            # 打印完整的更新后Cookie（可选择性启用）
+            logger.info(f"【{self.cookie_id}】更新后的完整Cookie: {self.cookies_str}")
+
+            # 打印主要的Cookie字段详情
+            important_cookies = ['_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'unb', 'uc1', 'uc3', 'uc4']
+            logger.info(f"【{self.cookie_id}】重要Cookie字段详情:")
+            for cookie_name in important_cookies:
+                if cookie_name in new_cookies_dict:
+                    cookie_value = new_cookies_dict[cookie_name]
+                    # 对于敏感信息，只显示前后几位
+                    if len(cookie_value) > 20:
+                        display_value = f"{cookie_value[:8]}...{cookie_value[-8:]}"
+                    else:
+                        display_value = cookie_value
+
+                    # 标记是否发生了变化
+                    change_mark = " [已变化]" if cookie_name in changed_cookies else " [新增]" if cookie_name in new_cookies else ""
+                    logger.info(f"【{self.cookie_id}】  {cookie_name}: {display_value}{change_mark}")
+
+            # 更新数据库中的Cookie
+            await self.update_config_cookies()
+
+            logger.info(f"【{self.cookie_id}】Cookie刷新完成")
+            return True
+
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】通过浏览器刷新Cookie失败: {self._safe_str(e)}")
+            return False
+        finally:
+            # 确保资源清理
+            try:
+                if browser:
+                    await browser.close()
+                if playwright:
+                    await playwright.stop()
+            except Exception as cleanup_e:
+                logger.warning(f"【{self.cookie_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
 
     async def send_msg_once(self, toid, item_id, text):
         headers = {
@@ -3538,7 +4294,7 @@ class XianyuLive:
 
                 # 🔔 立即发送消息通知（独立于自动回复功能）
                 try:
-                    await self.send_notification(send_user_name, send_user_id, send_message, item_id)
+                    await self.send_notification(send_user_name, send_user_id, send_message, item_id, chat_id)
                 except Exception as notify_error:
                     logger.error(f"📱 发送消息通知失败: {self._safe_str(notify_error)}")
 
@@ -3763,6 +4519,10 @@ class XianyuLive:
                         logger.info(f"【{self.cookie_id}】WebSocket连接建立成功！")
                         self.ws = websocket
 
+                        # 更新连接状态
+                        self.connection_failures = 0
+                        self.last_successful_connection = time.time()
+
                         logger.info(f"【{self.cookie_id}】开始初始化WebSocket连接...")
                         await self.init(websocket)
                         logger.info(f"【{self.cookie_id}】WebSocket初始化完成！")
@@ -3779,6 +4539,11 @@ class XianyuLive:
                         if not self.cleanup_task:
                             logger.info(f"【{self.cookie_id}】启动暂停记录清理任务...")
                             self.cleanup_task = asyncio.create_task(self.pause_cleanup_loop())
+
+                        # 启动Cookie刷新任务
+                        if not self.cookie_refresh_task:
+                            logger.info(f"【{self.cookie_id}】启动Cookie刷新任务...")
+                            self.cookie_refresh_task = asyncio.create_task(self.cookie_refresh_loop())
 
                         logger.info(f"【{self.cookie_id}】开始监听WebSocket消息...")
                         logger.info(f"【{self.cookie_id}】WebSocket连接状态正常，等待服务器消息...")
@@ -3802,16 +4567,57 @@ class XianyuLive:
                                 continue
 
                 except Exception as e:
-                    logger.error(f"WebSocket连接异常: {self._safe_str(e)}")
+                    error_msg = self._safe_str(e)
+                    self.connection_failures += 1
+
+                    logger.error(f"WebSocket连接异常 ({self.connection_failures}/{self.max_connection_failures}): {error_msg}")
+
+                    # 检查是否超过最大失败次数
+                    if self.connection_failures >= self.max_connection_failures:
+                        logger.error(f"【{self.cookie_id}】连续连接失败{self.max_connection_failures}次，暂停重试30分钟")
+                        await asyncio.sleep(1800)  # 暂停30分钟
+                        self.connection_failures = 0  # 重置失败计数
+                        continue
+
+                    # 根据错误类型和失败次数决定处理策略
+                    if "no close frame received or sent" in error_msg:
+                        logger.info(f"【{self.cookie_id}】检测到WebSocket连接意外断开，准备重新连接...")
+                        retry_delay = min(3 * self.connection_failures, 15)  # 递增重试间隔，最大15秒
+                    elif "Connection refused" in error_msg or "timeout" in error_msg.lower():
+                        logger.warning(f"【{self.cookie_id}】网络连接问题，延长重试间隔...")
+                        retry_delay = min(10 * self.connection_failures, 60)  # 递增重试间隔，最大60秒
+                    else:
+                        logger.warning(f"【{self.cookie_id}】未知WebSocket错误，使用默认重试间隔...")
+                        retry_delay = min(5 * self.connection_failures, 30)  # 递增重试间隔，最大30秒
+
+                    # 清空当前token，确保重新连接时会重新获取
+                    if self.current_token:
+                        logger.info(f"【{self.cookie_id}】清空当前token，重新连接时将重新获取")
+                        self.current_token = None
+
+                    # 取消所有任务并重置为None
                     if self.heartbeat_task:
                         self.heartbeat_task.cancel()
+                        self.heartbeat_task = None
                     if self.token_refresh_task:
                         self.token_refresh_task.cancel()
+                        self.token_refresh_task = None
                     if self.cleanup_task:
                         self.cleanup_task.cancel()
-                    await asyncio.sleep(5)  # 等待5秒后重试
+                        self.cleanup_task = None
+                    if self.cookie_refresh_task:
+                        self.cookie_refresh_task.cancel()
+                        self.cookie_refresh_task = None
+
+                    logger.info(f"【{self.cookie_id}】等待 {retry_delay} 秒后重试连接...")
+                    await asyncio.sleep(retry_delay)
                     continue
         finally:
+            # 清空当前token
+            if self.current_token:
+                logger.info(f"【{self.cookie_id}】程序退出，清空当前token")
+                self.current_token = None
+
             # 清理所有任务
             if self.heartbeat_task:
                 self.heartbeat_task.cancel()
@@ -3819,6 +4625,8 @@ class XianyuLive:
                 self.token_refresh_task.cancel()
             if self.cleanup_task:
                 self.cleanup_task.cancel()
+            if self.cookie_refresh_task:
+                self.cookie_refresh_task.cancel()
             await self.close_session()  # 确保关闭session
 
     async def get_item_list_info(self, page_number=1, page_size=20, retry_count=0):
